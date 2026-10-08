@@ -1,0 +1,51 @@
+{
+  "name": "after-publish",
+  "version": "0.0.1",
+  "description": "Espera a que la versión actual de un paquete aparezca en npm e informa el estado del workflow publish.yml de GitHub Actions",
+  "author": "ari.dc.uba.ar",
+  "type": "module",
+  "main": "after-publish.js",
+  "exports": {
+    ".": "./after-publish.js"
+  },
+  "bin": {
+    "after-publish": "bin/after-publish-cli.js"
+  },
+  "files": [
+    "bin",
+    "after-publish.js"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "echo no tests yet!",
+    "test-ci": "echo no tests yet!"
+  },
+  "devDependencies": {
+    "qa-control": "^0.12.0"
+  },
+  "keywords": [
+    "npm",
+    "publish",
+    "github-actions",
+    "cli"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ari-dc-uba-ar/after-publish.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ari-dc-uba-ar/after-publish/issues"
+  },
+  "homepage": "https://github.com/ari-dc-uba-ar/after-publish#readme",
+  "license": "MIT",
+  "qa-control": {
+    "run-in": "server",
+    "type": "cmd-tool",
+    "gha": {
+      "skip_tests": true
+    },
+    "multilang": "no"
+  }
+}
