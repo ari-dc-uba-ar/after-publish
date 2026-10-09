@@ -45,7 +45,7 @@ const NPM_NAME_PATTERN = /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]
 
 /** @typedef {{ name: string, version: string, owner: string, repo: string }} PackageInfo */
 /** @typedef {(line: string) => void} LogFunction */
-/** @typedef {{ status: string, conclusion: string | null, htmlUrl: string, headBranch: string | null }} RunInfo */
+/** @typedef {{ id: number, status: string, conclusion: string | null, htmlUrl: string, headBranch: string | null }} RunInfo */
 
 /** @type {Record<string, string>} */
 const STATUS_TEXT = {
@@ -209,9 +209,10 @@ export async function getNpmVersionStatus(name, version) {
  */
 function parseRun(run) {
     if (!isRecord(run)) return null;
-    const { status, conclusion, html_url: htmlUrl, head_branch: headBranch } = run;
-    if (typeof status !== 'string' || typeof htmlUrl !== 'string') return null;
+    const { id, status, conclusion, html_url: htmlUrl, head_branch: headBranch } = run;
+    if (typeof id !== 'number' || typeof status !== 'string' || typeof htmlUrl !== 'string') return null;
     return {
+        id,
         status,
         conclusion: typeof conclusion === 'string' ? conclusion : null,
         htmlUrl,
@@ -231,31 +232,93 @@ function parseRun(run) {
 export async function getWorkflowRun(info, tag, sha, token) {
     const params = new URLSearchParams({ per_page: '10' });
     if (sha != null) params.set('head_sha', sha);
-    const url = `https://api.github.com/repos/${encodeURIComponent(info.owner)}/${encodeURIComponent(info.repo)}`
-        + `/actions/workflows/${encodeURIComponent(WORKFLOW_FILE)}/runs?${params}`;
-    /** @type {Record<string, string>} */
-    const headers = {
-        accept: 'application/vnd.github+json',
-        'x-github-api-version': '2022-11-28',
-        'user-agent': 'esperar-publicacion',
-    };
-    if (token != null) headers.authorization = `Bearer ${token}`;
-    const res = await fetch(url, { headers });
-    if (res.status === 404) throw new Error(`no se encontró ${WORKFLOW_FILE} en ${info.owner}/${info.repo}`);
-    if (!res.ok) throw new Error(`GitHub respondió ${res.status}`);
-    /** @type {unknown} */
-    const data = await res.json();
-    if (!isRecord(data)) throw new Error('respuesta inesperada de GitHub');
-    /** @type {unknown} */
-    const rawRuns = data.workflow_runs;
-    if (!Array.isArray(rawRuns)) throw new Error('respuesta inesperada de GitHub');
-    /** @type {unknown[]} */
-    const runs = rawRuns;
-    for (const rawRun of runs) {
+    const data = await githubGet(info, `/actions/workflows/${encodeURIComponent(WORKFLOW_FILE)}/runs?${params}`, token);
+    if (data == null) throw new Error(`no se encontró ${WORKFLOW_FILE} en ${info.owner}/${info.repo}`);
+    for (const rawRun of recordArray(data, 'workflow_runs')) {
         const run = parseRun(rawRun);
         if (run != null && (sha != null || run.headBranch === tag)) return run;
     }
     return null;
+}
+
+/**
+ * @param {PackageInfo} info
+ * @param {string} path ruta dentro del repositorio, empezando con /
+ * @param {string | null} token
+ * @returns {Promise<unknown | null>} null si GitHub responde 404
+ */
+async function githubGet(info, path, token) {
+    const url = `https://api.github.com/repos/${encodeURIComponent(info.owner)}/${encodeURIComponent(info.repo)}${path}`;
+    /** @type {Record<string, string>} */
+    const headers = {
+        accept: 'application/vnd.github+json',
+        'x-github-api-version': '2022-11-28',
+        'user-agent': 'after-publish',
+    };
+    if (token != null) headers.authorization = `Bearer ${token}`;
+    const res = await fetch(url, { headers });
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`GitHub respondió ${res.status}`);
+    /** @type {unknown} */
+    const data = await res.json();
+    return data;
+}
+
+/**
+ * Devuelve el arreglo `data[key]`, o lanza un error si la respuesta no tiene esa forma.
+ * @param {unknown} data
+ * @param {string} key
+ * @returns {unknown[]}
+ */
+function recordArray(data, key) {
+    if (!isRecord(data)) throw new Error('respuesta inesperada de GitHub');
+    /** @type {unknown} */
+    const value = data[key];
+    if (!Array.isArray(value)) throw new Error('respuesta inesperada de GitHub');
+    /** @type {unknown[]} */
+    const items = value;
+    return items;
+}
+
+/**
+ * @param {unknown} value
+ * @returns {Record<string, unknown>[]}
+ */
+function onlyRecords(value) {
+    return Array.isArray(value) ? value.filter(isRecord) : [];
+}
+
+const FAILED_CONCLUSIONS = ['failure', 'timed_out', 'cancelled', 'startup_failure'];
+const MAX_ANNOTATIONS_PER_JOB = 5;
+
+/**
+ * Describe por qué falló una ejecución: cada job fallido con sus pasos fallidos,
+ * y los mensajes de error que GitHub dejó como anotaciones de ese job.
+ * @param {PackageInfo} info
+ * @param {number} runId
+ * @param {string | null} token
+ * @returns {Promise<string[]>} una línea por dato
+ */
+export async function getRunFailureDetails(info, runId, token) {
+    /** @type {string[]} */
+    const lines = [];
+    const jobs = await githubGet(info, `/actions/runs/${runId}/jobs?per_page=100`, token);
+    for (const job of onlyRecords(recordArray(jobs, 'jobs'))) {
+        if (typeof job.conclusion !== 'string' || !FAILED_CONCLUSIONS.includes(job.conclusion)) continue;
+        const jobName = typeof job.name === 'string' ? job.name : 'sin nombre';
+        const failedSteps = onlyRecords(job.steps)
+            .filter((step) => typeof step.conclusion === 'string' && FAILED_CONCLUSIONS.includes(step.conclusion))
+            .map((step) => (typeof step.name === 'string' ? `"${step.name}"` : 'sin nombre'));
+        lines.push(`job "${jobName}": ${job.conclusion}`
+            + (failedSteps.length > 0 ? `, paso ${failedSteps.join(', ')}` : ''));
+        if (typeof job.id !== 'number') continue;
+        const annotations = await githubGet(info, `/check-runs/${job.id}/annotations`, token);
+        onlyRecords(annotations)
+            .filter((annotation) => annotation.annotation_level === 'failure' && typeof annotation.message === 'string')
+            .slice(0, MAX_ANNOTATIONS_PER_JOB)
+            .forEach((annotation) => { lines.push(`error: ${String(annotation.message).trim()}`); });
+    }
+    return lines;
 }
 
 /**
@@ -386,22 +449,40 @@ function shouldQueryGithub(state, tick) {
  * Consulta el workflow y devuelve el texto a informar, si terminó y si terminó sin éxito.
  * @param {WatchState} state
  * @param {string} elapsed
- * @returns {Promise<{ text: string, done: boolean, failed: boolean }>}
+ * @returns {Promise<{ text: string, done: boolean, failed: boolean, details: string[] }>}
  */
 async function checkWorkflow(state, elapsed) {
     state.githubQueries++;
     try {
         const run = await getWorkflowRun(state.info, state.tag, state.sha, state.token);
-        if (run == null) return { text: 'todavía sin ejecución', done: false, failed: false };
+        if (run == null) return { text: 'todavía sin ejecución', done: false, failed: false, details: [] };
         if (run.htmlUrl !== state.shownRunUrl) {
             state.log(`${elapsed} ejecución: ${run.htmlUrl}`);
             state.shownRunUrl = run.htmlUrl;
         }
         const done = run.status === 'completed';
-        return { text: describeRun(run), done, failed: done && run.conclusion !== 'success' };
+        const failed = done && run.conclusion !== 'success';
+        const details = failed ? await describeFailure(state, run) : [];
+        return { text: describeRun(run), done, failed, details };
     } catch (err) {
-        return { text: `error (${describeError(err)})`, done: false, failed: false };
+        return { text: `error (${describeError(err)})`, done: false, failed: false, details: [] };
     }
+}
+
+/**
+ * @param {WatchState} state
+ * @param {RunInfo} run
+ * @returns {Promise<string[]>}
+ */
+async function describeFailure(state, run) {
+    /** @type {string[]} */
+    let details;
+    try {
+        details = await getRunFailureDetails(state.info, run.id, state.token);
+    } catch (err) {
+        details = [`no se pudo obtener el detalle (${describeError(err)})`];
+    }
+    return [...details, `ver: ${run.htmlUrl}`];
 }
 
 /**
@@ -435,6 +516,7 @@ async function watchTick(state, tick) {
         const workflow = await checkWorkflow(state, elapsed);
         const workflowText = `${WORKFLOW_FILE}: ${workflow.text}`;
         state.log(npm.status === 'error' ? `${npmLine} | ${workflowText}` : `${elapsed} ${workflowText}`);
+        workflow.details.forEach((detail) => { state.log(`      ${detail}`); });
         state.workflowDone = workflow.done;
         failed = workflow.failed;
     } else {
