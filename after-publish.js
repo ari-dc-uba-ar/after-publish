@@ -6,7 +6,9 @@
  * Este módulo no tiene efectos al importarse. La línea de comandos está en bin/after-publish-cli.js.
  *
  * Token de GitHub (opcional, se busca en este orden): GITHUB_TOKEN, GH_TOKEN, `gh auth token`.
- * Sin token la API de GitHub permite 60 consultas por hora, por eso se consulta cada 5 s y solo 4 veces.
+ * Mientras falte pushear commits o el tag al remoto, se informa "push pending" y no se consulta nada más.
+ * Después, npm se consulta en cada vuelta (cada 5 s). Con token, GitHub también; sin token la API de GitHub
+ * permite 60 consultas por hora, por eso se consulta solo 4 veces: a los 5, 15, 25 y 35 s de terminado el push.
  */
 
 import { readFile } from 'node:fs/promises';
@@ -19,9 +21,11 @@ const execFileAsync = promisify(execFile);
 
 const WORKFLOW_FILE = 'publish.yml';
 const TAG_PREFIX = 'v';
-const TICK_MS = 1000;
-const GITHUB_EVERY_TICKS_WITH_TOKEN = 3;
-const GITHUB_EVERY_TICKS_WITHOUT_TOKEN = 5;
+const GIT_REMOTE = 'origin';
+/** npm se consulta en cada vuelta; con token, GitHub también */
+const TICK_MS = 5000;
+const GITHUB_FIRST_MS_WITHOUT_TOKEN = 5000;
+const GITHUB_INTERVAL_MS_WITHOUT_TOKEN = 10000;
 const GITHUB_MAX_QUERIES_WITHOUT_TOKEN = 4;
 const TIMEOUT_MS = 20 * 60 * 1000;
 
@@ -116,30 +120,87 @@ async function getGithubToken() {
 
 /**
  * @param {string} dir
- * @param {string} tag
- * @returns {Promise<string | null>}
+ * @param {string[]} args
+ * @returns {Promise<string | null>} la salida sin espacios al final, o null si git falla
  */
-async function getTagCommit(dir, tag) {
+async function gitOutput(dir, args) {
     try {
-        const { stdout } = await execFileAsync('git', ['rev-list', '-n', '1', tag, '--'], { cwd: dir });
-        const sha = stdout.trim();
-        return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+        const { stdout } = await execFileAsync('git', args, { cwd: dir });
+        return stdout.trim();
     } catch {
         return null;
     }
 }
 
 /**
- * @param {string} name
- * @param {string} version
+ * @param {string} dir
+ * @param {string} tag
+ * @returns {Promise<string | null>}
+ */
+async function getTagCommit(dir, tag) {
+    const sha = await gitOutput(dir, ['rev-list', '-n', '1', tag, '--']);
+    return sha != null && /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+}
+
+/**
+ * Indica si hay archivos versionados con cambios sin commitear (no cuenta los archivos nuevos sin agregar).
+ * Si no se puede averiguar (por ejemplo, no es un repositorio git), no los da por existentes.
+ * @param {string} dir
  * @returns {Promise<boolean>}
  */
-export async function isPublishedOnNpm(name, version) {
-    const url = `https://registry.npmjs.org/${name.replace('/', '%2F')}/${encodeURIComponent(version)}`;
-    const res = await fetch(url, { headers: { accept: 'application/json', 'cache-control': 'no-cache' } });
-    if (res.status === 404) return false;
+export async function hasUncommittedChanges(dir) {
+    const status = await gitOutput(dir, ['status', '--porcelain', '--untracked-files=no']);
+    return status != null && status !== '';
+}
+
+/**
+ * Indica si falta pushear: commits de la rama actual que su upstream no tiene, o el tag que el remoto no tiene.
+ * Si no se puede averiguar (sin upstream, sin remoto, sin red), no lo da por pendiente.
+ * @param {string} dir
+ * @param {string} tag
+ * @returns {Promise<boolean>}
+ */
+export async function isPushPending(dir, tag) {
+    const ahead = await gitOutput(dir, ['rev-list', '--count', '@{u}..HEAD']);
+    if (ahead != null && Number.parseInt(ahead, 10) > 0) return true;
+    const localTag = await gitOutput(dir, ['rev-parse', '-q', '--verify', `refs/tags/${tag}`]);
+    if (localTag == null || localTag === '') return false;
+    const remoteTag = await gitOutput(dir, ['ls-remote', '--tags', GIT_REMOTE, `refs/tags/${tag}`]);
+    return remoteTag === '';
+}
+
+/**
+ * @param {string} url
+ * @param {string} accept
+ * @returns {Promise<unknown | null>} null si el registry responde 404
+ */
+async function fetchRegistry(url, accept) {
+    // la CDN del registry ignora "cache-control: no-cache" y responde copias de hasta 5 minutos;
+    // un parámetro distinto en cada consulta obliga a pedirla al registry
+    const res = await fetch(`${url}?t=${Date.now()}`, { headers: { accept } });
+    if (res.status === 404) return null;
     if (!res.ok) throw new Error(`registry respondió ${res.status}`);
-    return true;
+    /** @type {unknown} */
+    const data = await res.json();
+    return data;
+}
+
+/**
+ * Estado de una versión en npm:
+ * - published: figura en el documento del paquete, que es lo que usa `npm install`.
+ * - validating: el registry ya tiene el documento de la versión, pero todavía no la lista
+ *   (en npmjs.com figura como "Validating": la revisión automática no terminó).
+ * - absent: el registry no la conoce.
+ * @param {string} name
+ * @param {string} version
+ * @returns {Promise<'published' | 'validating' | 'absent'>}
+ */
+export async function getNpmVersionStatus(name, version) {
+    const base = `https://registry.npmjs.org/${name.replace('/', '%2F')}`;
+    const packument = await fetchRegistry(base, 'application/vnd.npm.install-v1+json');
+    if (isRecord(packument) && isRecord(packument.versions) && version in packument.versions) return 'published';
+    const versionDocument = await fetchRegistry(`${base}/${encodeURIComponent(version)}`, 'application/json');
+    return versionDocument == null ? 'absent' : 'validating';
 }
 
 /**
@@ -214,23 +275,28 @@ function formatElapsed(ms) {
  */
 function describeRun(run) {
     if (run.status !== 'completed') return STATUS_TEXT[run.status] ?? run.status;
-    if (run.conclusion === 'success') return 'terminó bien (esperando que npm lo muestre)';
+    if (run.conclusion === 'success') return 'terminó bien';
     return `terminó: ${run.conclusion ?? 'sin conclusión'}`;
 }
 
 /**
  * @typedef {{
  *   info: PackageInfo,
+ *   dir: string,
  *   log: LogFunction,
  *   tag: string,
  *   sha: string | null,
+ *   uncommitted: boolean,
  *   token: string | null,
+ *   githubFirstTick: number,
  *   githubEveryTicks: number,
  *   githubMaxQueries: number | null,
  *   start: number,
- *   actionText: string,
  *   shownRunUrl: string | null,
  *   githubQueries: number,
+ *   npmValidating: boolean,
+ *   workflowDone: boolean,
+ *   pushedAtTick: number | null,
  * }} WatchState
  */
 
@@ -244,18 +310,24 @@ async function prepareWatch(dir, log) {
     const tag = `${TAG_PREFIX}${info.version}`;
     const token = await getGithubToken();
     const sha = await getTagCommit(dir, tag);
+    const uncommitted = await hasUncommittedChanges(dir);
     return {
         info,
+        dir,
         log,
         tag,
         sha,
+        uncommitted,
         token,
-        githubEveryTicks: token != null ? GITHUB_EVERY_TICKS_WITH_TOKEN : GITHUB_EVERY_TICKS_WITHOUT_TOKEN,
+        githubFirstTick: token != null ? 0 : GITHUB_FIRST_MS_WITHOUT_TOKEN / TICK_MS,
+        githubEveryTicks: token != null ? 1 : GITHUB_INTERVAL_MS_WITHOUT_TOKEN / TICK_MS,
         githubMaxQueries: token != null ? null : GITHUB_MAX_QUERIES_WITHOUT_TOKEN,
         start: Date.now(),
-        actionText: 'sin consultar',
         shownRunUrl: null,
         githubQueries: 0,
+        npmValidating: false,
+        workflowDone: false,
+        pushedAtTick: null,
     };
 }
 
@@ -264,25 +336,33 @@ async function prepareWatch(dir, log) {
  * @returns {void}
  */
 function printHeader(state) {
-    const { info, tag, sha, token, log } = state;
+    const { info, tag, sha, uncommitted, token, log } = state;
     log(`Esperando ${info.name}@${info.version} — ${info.owner}/${info.repo}, tag ${tag}`
         + (sha != null ? ` (${sha.slice(0, 7)})` : ' (tag no encontrado localmente)'));
+    if (uncommitted) log(`uncommitted: hay cambios sin commitear (no forman parte de ${tag})`);
     if (token == null) {
-        log(`Sin token de GitHub: ${WORKFLOW_FILE} se consulta cada ${GITHUB_EVERY_TICKS_WITHOUT_TOKEN} s, `
-            + `solo ${GITHUB_MAX_QUERIES_WITHOUT_TOKEN} veces.`);
+        log(`Sin token de GitHub: ${WORKFLOW_FILE} se consulta ${GITHUB_MAX_QUERIES_WITHOUT_TOKEN} veces, `
+            + `cada ${GITHUB_INTERVAL_MS_WITHOUT_TOKEN / 1000} s a partir de los ${GITHUB_FIRST_MS_WITHOUT_TOKEN / 1000} s de terminado el push.`);
     }
 }
 
+/** @type {Record<'published' | 'validating' | 'absent', string>} */
+const NPM_STATUS_TEXT = {
+    published: 'publicado',
+    validating: 'validando (revisión automática de npm)',
+    absent: 'no publicado',
+};
+
 /**
  * @param {PackageInfo} info
- * @returns {Promise<{ published: boolean, text: string }>}
+ * @returns {Promise<{ status: 'published' | 'validating' | 'absent' | 'error', text: string }>}
  */
 async function checkNpm(info) {
     try {
-        const published = await isPublishedOnNpm(info.name, info.version);
-        return { published, text: published ? 'publicado' : 'no publicado' };
+        const status = await getNpmVersionStatus(info.name, info.version);
+        return { status, text: NPM_STATUS_TEXT[status] };
     } catch (err) {
-        return { published: false, text: `error (${describeError(err)})` };
+        return { status: 'error', text: `error (${describeError(err)})` };
     }
 }
 
@@ -292,72 +372,114 @@ async function checkNpm(info) {
  * @returns {boolean}
  */
 function shouldQueryGithub(state, tick) {
+    // si npm ya la está validando, el workflow ya publicó: no hace falta seguir mirándolo
+    if (state.npmValidating) return false;
+    // si el workflow ya terminó bien, solo falta esperar a npm
+    if (state.workflowDone) return false;
     const queriesLeft = state.githubMaxQueries == null || state.githubQueries < state.githubMaxQueries;
-    return tick % state.githubEveryTicks === 0 && queriesLeft;
+    if (state.pushedAtTick == null) return false;
+    const sinceFirst = tick - state.pushedAtTick - state.githubFirstTick;
+    return sinceFirst >= 0 && sinceFirst % state.githubEveryTicks === 0 && queriesLeft;
 }
 
 /**
- * Consulta el workflow, actualiza el estado y devuelve true si terminó sin éxito.
+ * Consulta el workflow y devuelve el texto a informar, si terminó y si terminó sin éxito.
  * @param {WatchState} state
  * @param {string} elapsed
- * @returns {Promise<boolean>}
+ * @returns {Promise<{ text: string, done: boolean, failed: boolean }>}
  */
 async function checkWorkflow(state, elapsed) {
     state.githubQueries++;
     try {
         const run = await getWorkflowRun(state.info, state.tag, state.sha, state.token);
-        if (run == null) {
-            state.actionText = 'todavía sin ejecución';
-            return false;
-        }
-        state.actionText = describeRun(run);
+        if (run == null) return { text: 'todavía sin ejecución', done: false, failed: false };
         if (run.htmlUrl !== state.shownRunUrl) {
             state.log(`${elapsed} ejecución: ${run.htmlUrl}`);
             state.shownRunUrl = run.htmlUrl;
         }
-        return run.status === 'completed' && run.conclusion !== 'success';
+        const done = run.status === 'completed';
+        return { text: describeRun(run), done, failed: done && run.conclusion !== 'success' };
     } catch (err) {
-        state.actionText = `error (${describeError(err)})`;
-        return false;
+        return { text: `error (${describeError(err)})`, done: false, failed: false };
     }
 }
 
 /**
- * @param {WatchState} state
- * @param {string} elapsed
- * @param {string} npmText
- * @returns {void}
- */
-function printStatus(state, elapsed, npmText) {
-    const limitText = state.githubMaxQueries != null && state.githubQueries >= state.githubMaxQueries ? ' (sin más consultas)' : '';
-    state.log(`${elapsed} npm: ${npmText} | ${WORKFLOW_FILE}: ${state.actionText}${limitText}`);
-}
-
-/**
- * Ejecuta una vuelta del ciclo. Devuelve el código de salida si hay que terminar, o null para seguir.
+ * Ejecuta una vuelta del ciclo e informa una línea con lo consultado en ella.
+ * Si se consultó el workflow, la línea informa su estado: que npm no la tiene se sobrentiende
+ * (si la tuviera, ya se habría terminado, y si la estuviera validando, no se consultaría el workflow).
+ * Devuelve el código de salida si hay que terminar, o null para seguir.
  * @param {WatchState} state
  * @param {number} tick
  * @returns {Promise<number | null>}
  */
 async function watchTick(state, tick) {
     const elapsed = formatElapsed(Date.now() - state.start);
+    if (state.pushedAtTick == null) {
+        await refreshVersion(state, elapsed);
+        if (await isPushPending(state.dir, state.tag)) {
+            state.log(`${elapsed} push pending`);
+            return checkTimeout(state);
+        }
+        state.pushedAtTick = tick;
+    }
     const npm = await checkNpm(state.info);
-    if (npm.published) {
+    if (npm.status === 'validating') state.npmValidating = true;
+    if (npm.status === 'published') {
         state.log(`${elapsed} publicado en npm: ${state.info.name}@${state.info.version}`);
         return EXIT_CODE.published;
     }
-    const failed = shouldQueryGithub(state, tick) && await checkWorkflow(state, elapsed);
-    printStatus(state, elapsed, npm.text);
-    if (failed) return EXIT_CODE.workflowFailed;
-    if (Date.now() - state.start > TIMEOUT_MS) {
-        state.log(`Se agotó el tiempo de espera (${TIMEOUT_MS / 60000} min).`);
-        return EXIT_CODE.timeout;
+    const npmLine = `${elapsed} npm: ${npm.text}`;
+    let failed = false;
+    if (shouldQueryGithub(state, tick)) {
+        const workflow = await checkWorkflow(state, elapsed);
+        const workflowText = `${WORKFLOW_FILE}: ${workflow.text}`;
+        state.log(npm.status === 'error' ? `${npmLine} | ${workflowText}` : `${elapsed} ${workflowText}`);
+        state.workflowDone = workflow.done;
+        failed = workflow.failed;
+    } else {
+        state.log(npmLine);
     }
-    return null;
+    if (failed) return EXIT_CODE.workflowFailed;
+    return checkTimeout(state);
 }
 
 /**
- * Espera a que la versión del package.json de `dir` esté publicada en npm, informando una línea por segundo.
+ * Mientras falta el push, la versión puede cambiar (por ejemplo, con un `npm version` hecho durante la espera):
+ * vuelve a leer el package.json y, si cambió, pasa a esperar la versión nueva.
+ * Si el package.json no se puede leer en este momento (por ejemplo, se está escribiendo), sigue con la anterior.
+ * @param {WatchState} state
+ * @param {string} elapsed
+ * @returns {Promise<void>}
+ */
+async function refreshVersion(state, elapsed) {
+    /** @type {PackageInfo} */
+    let info;
+    try {
+        info = await readPackageInfo(state.dir);
+    } catch {
+        return;
+    }
+    if (info.name === state.info.name && info.version === state.info.version) return;
+    state.info = info;
+    state.tag = `${TAG_PREFIX}${info.version}`;
+    state.sha = await getTagCommit(state.dir, state.tag);
+    state.log(`${elapsed} versión cambiada: ahora espera ${info.name}@${info.version}, tag ${state.tag}`
+        + (state.sha != null ? ` (${state.sha.slice(0, 7)})` : ' (tag no encontrado localmente)'));
+}
+
+/**
+ * @param {WatchState} state
+ * @returns {number | null} EXIT_CODE.timeout si se agotó el tiempo de espera, o null para seguir
+ */
+function checkTimeout(state) {
+    if (Date.now() - state.start <= TIMEOUT_MS) return null;
+    state.log(`Se agotó el tiempo de espera (${TIMEOUT_MS / 60000} min).`);
+    return EXIT_CODE.timeout;
+}
+
+/**
+ * Espera a que la versión del package.json de `dir` esté publicada en npm, informando una línea por cada consulta (cada 5 s).
  * Devuelve EXIT_CODE.published, EXIT_CODE.workflowFailed o EXIT_CODE.timeout.
  * Si el package.json no es válido o el repositorio no es de GitHub, lanza un error.
  * @param {string} dir
