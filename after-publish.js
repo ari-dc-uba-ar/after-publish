@@ -44,7 +44,12 @@ export const EXIT_CODE = Object.freeze({
 const NPM_NAME_PATTERN = /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/;
 
 /** @typedef {{ name: string, version: string, owner: string, repo: string }} PackageInfo */
-/** @typedef {(line: string) => void} LogFunction */
+/** @typedef {'info' | 'warning'} LogLevel */
+/**
+ * Recibe cada línea a informar. Las advertencias llegan con level 'warning' para que quien muestre
+ * la salida pueda destacarlas (por ejemplo, con color); por omisión se informan como cualquier línea.
+ * @typedef {(line: string, level?: LogLevel) => void} LogFunction
+ */
 /** @typedef {{ id: number, status: string, conclusion: string | null, htmlUrl: string, headBranch: string | null }} RunInfo */
 
 /** @type {Record<string, string>} */
@@ -432,10 +437,11 @@ function printHeader(state) {
     const { info, tag, sha, uncommitted, token, log } = state;
     log(`Esperando ${info.name}@${info.version} — ${info.owner}/${info.repo}, tag ${tag}`
         + (sha != null ? ` (${sha.slice(0, 7)})` : ' (tag no encontrado localmente)'));
-    if (uncommitted) log(`uncommitted: hay cambios sin commitear (no forman parte de ${tag})`);
+    if (uncommitted) log(`uncommitted: hay cambios sin commitear (no forman parte de ${tag})`, 'warning');
     if (token == null) {
         log(`Sin token de GitHub: ${WORKFLOW_FILE} se consulta ${GITHUB_MAX_QUERIES_WITHOUT_TOKEN} veces, `
-            + `cada ${GITHUB_INTERVAL_MS_WITHOUT_TOKEN / 1000} s a partir de los ${GITHUB_FIRST_MS_WITHOUT_TOKEN / 1000} s de terminado el push.`);
+            + `cada ${GITHUB_INTERVAL_MS_WITHOUT_TOKEN / 1000} s a partir de los ${GITHUB_FIRST_MS_WITHOUT_TOKEN / 1000} s de terminado el push.`
+            + ' Para más detalle, definí GITHUB_TOKEN o usá `gh auth login`.', 'warning');
     }
 }
 
