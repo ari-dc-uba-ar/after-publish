@@ -288,6 +288,37 @@ function onlyRecords(value) {
     return Array.isArray(value) ? value.filter(isRecord) : [];
 }
 
+const ACTIVE_JOB_STATUSES = ['in_progress'];
+const WAITING_JOB_STATUSES = ['queued', 'waiting', 'pending', 'requested'];
+
+/**
+ * Describe en qué está una ejecución que no terminó: el job que está corriendo y su paso en curso,
+ * o, si ninguno corre, el job que espera runner. Devuelve null si no hay nada que agregar.
+ * @param {PackageInfo} info
+ * @param {number} runId
+ * @param {string | null} token
+ * @returns {Promise<string | null>}
+ */
+export async function getRunProgress(info, runId, token) {
+    const jobs = onlyRecords(recordArray(await githubGet(info, `/actions/runs/${runId}/jobs?per_page=100`, token), 'jobs'));
+    const running = jobs.find((job) => typeof job.status === 'string' && ACTIVE_JOB_STATUSES.includes(job.status));
+    if (running != null) {
+        const step = onlyRecords(running.steps)
+            .find((candidate) => typeof candidate.status === 'string' && ACTIVE_JOB_STATUSES.includes(candidate.status));
+        return `job "${jobName(running)}"` + (step != null && typeof step.name === 'string' ? `, paso "${step.name}"` : '');
+    }
+    const waiting = jobs.find((job) => typeof job.status === 'string' && WAITING_JOB_STATUSES.includes(job.status));
+    return waiting != null ? `job "${jobName(waiting)}" esperando runner` : null;
+}
+
+/**
+ * @param {Record<string, unknown>} job
+ * @returns {string}
+ */
+function jobName(job) {
+    return typeof job.name === 'string' ? job.name : 'sin nombre';
+}
+
 const FAILED_CONCLUSIONS = ['failure', 'timed_out', 'cancelled', 'startup_failure'];
 const MAX_ANNOTATIONS_PER_JOB = 5;
 
@@ -305,11 +336,10 @@ export async function getRunFailureDetails(info, runId, token) {
     const jobs = await githubGet(info, `/actions/runs/${runId}/jobs?per_page=100`, token);
     for (const job of onlyRecords(recordArray(jobs, 'jobs'))) {
         if (typeof job.conclusion !== 'string' || !FAILED_CONCLUSIONS.includes(job.conclusion)) continue;
-        const jobName = typeof job.name === 'string' ? job.name : 'sin nombre';
         const failedSteps = onlyRecords(job.steps)
             .filter((step) => typeof step.conclusion === 'string' && FAILED_CONCLUSIONS.includes(step.conclusion))
             .map((step) => (typeof step.name === 'string' ? `"${step.name}"` : 'sin nombre'));
-        lines.push(`job "${jobName}": ${job.conclusion}`
+        lines.push(`job "${jobName(job)}": ${job.conclusion}`
             + (failedSteps.length > 0 ? `, paso ${failedSteps.join(', ')}` : ''));
         if (typeof job.id !== 'number') continue;
         const annotations = await githubGet(info, `/check-runs/${job.id}/annotations`, token);
@@ -463,9 +493,26 @@ async function checkWorkflow(state, elapsed) {
         const done = run.status === 'completed';
         const failed = done && run.conclusion !== 'success';
         const details = failed ? await describeFailure(state, run) : [];
-        return { text: describeRun(run), done, failed, details };
+        const progress = done ? null : await describeProgress(state, run);
+        return { text: describeRun(run) + (progress != null ? ` — ${progress}` : ''), done, failed, details };
     } catch (err) {
         return { text: `error (${describeError(err)})`, done: false, failed: false, details: [] };
+    }
+}
+
+/**
+ * Job y paso en curso. Solo con token: sin token las consultas a GitHub son pocas y se reservan para el estado.
+ * Si no se puede obtener, devuelve null y se informa solo el estado de la ejecución.
+ * @param {WatchState} state
+ * @param {RunInfo} run
+ * @returns {Promise<string | null>}
+ */
+async function describeProgress(state, run) {
+    if (state.token == null) return null;
+    try {
+        return await getRunProgress(state.info, run.id, state.token);
+    } catch {
+        return null;
     }
 }
 
