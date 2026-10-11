@@ -1,6 +1,6 @@
 {
   "name": "after-publish",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "description": "Espera a que la versión actual de un paquete aparezca en npm e informa el estado del workflow publish.yml de GitHub Actions",
   "author": "ari.dc.uba.ar",
   "type": "module",
