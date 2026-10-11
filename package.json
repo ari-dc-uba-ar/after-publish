@@ -16,7 +16,7 @@
     "after-publish.js"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=22.18"
   },
   "scripts": {
     "test": "echo no tests yet!",
@@ -47,5 +47,8 @@
       "skip_tests": true
     },
     "multilang": "no"
+  },
+  "dependencies": {
+    "commendatore": "^0.0.3"
   }
 }

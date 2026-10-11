@@ -31,14 +31,19 @@ const TIMEOUT_MS = 20 * 60 * 1000;
 
 /** Resultado de waitForPublish, usado también como código de salida del comando. */
 export const EXIT_CODE = Object.freeze({
-    /** la versión está publicada en npm */
     published: 0,
-    /** el workflow terminó sin éxito (failure, cancelled, etc.) */
     workflowFailed: 1,
-    /** se agotó el tiempo de espera */
     timeout: 2,
-    /** error de configuración (package.json inválido, repositorio no reconocido, etc.) */
     configError: 3,
+});
+
+/** Qué significa cada resultado; el CLI lo usa para documentar los códigos de salida en su ayuda. */
+/** @type {Readonly<Record<keyof typeof EXIT_CODE, string>>} */
+export const EXIT_CODE_DESCRIPTION = Object.freeze({
+    published: 'la versión está publicada en npm',
+    workflowFailed: 'el workflow terminó sin éxito (failure, cancelled, etc.)',
+    timeout: 'se agotó el tiempo de espera',
+    configError: 'error de configuración (package.json inválido, repositorio no reconocido, etc.)',
 });
 
 const NPM_NAME_PATTERN = /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/;
@@ -91,11 +96,26 @@ export function parseGithubRepo(url) {
 
 /**
  * @param {string} dir
+ * @returns {Promise<string>}
+ */
+async function readPackageJsonText(dir) {
+    try {
+        return await readFile(join(dir, 'package.json'), 'utf8');
+    } catch (err) {
+        if (isRecord(err) && err.code === 'ENOENT') {
+            throw new Error(`No hay package.json en ${dir.replaceAll('\\', '/')}`);
+        }
+        throw err;
+    }
+}
+
+/**
+ * @param {string} dir
  * @returns {Promise<PackageInfo>}
  */
 export async function readPackageInfo(dir) {
     /** @type {unknown} */
-    const pkg = JSON.parse(await readFile(join(dir, 'package.json'), 'utf8'));
+    const pkg = JSON.parse(await readPackageJsonText(dir));
     if (!isRecord(pkg)) throw new Error('package.json no contiene un objeto');
     const { name, version, repository } = pkg;
     if (typeof name !== 'string' || !NPM_NAME_PATTERN.test(name)) throw new Error('package.json: "name" ausente o inválido');
@@ -614,15 +634,22 @@ function checkTimeout(state) {
 }
 
 /**
- * Espera a que la versión del package.json de `dir` esté publicada en npm, informando una línea por cada consulta (cada 5 s).
+ * @typedef {{
+ *   dir: string,
+ *   log: LogFunction,
+ * }} WaitForPublishOptions
+ * dir: carpeta del paquete (la que tiene el package.json); log: recibe cada línea a informar.
+ */
+
+/**
+ * Espera a que la versión del package.json de `options.dir` esté publicada en npm, informando una línea por cada consulta (cada 5 s).
  * Devuelve EXIT_CODE.published, EXIT_CODE.workflowFailed o EXIT_CODE.timeout.
  * Si el package.json no es válido o el repositorio no es de GitHub, lanza un error.
- * @param {string} dir
- * @param {LogFunction} [log]
+ * @param {WaitForPublishOptions} options
  * @returns {Promise<number>}
  */
-export async function waitForPublish(dir, log = console.log) {
-    const state = await prepareWatch(resolve(dir), log);
+export async function waitForPublish(options) {
+    const state = await prepareWatch(resolve(options.dir), options.log);
     printHeader(state);
     for (let tick = 0; ; tick++) {
         const tickStart = Date.now();
