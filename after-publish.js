@@ -53,7 +53,9 @@ const NPM_NAME_PATTERN = /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]
 /**
  * Recibe cada línea a informar. Las advertencias llegan con level 'warning' para que quien muestre
  * la salida pueda destacarlas (por ejemplo, con color); por omisión se informan como cualquier línea.
- * @typedef {(line: string, level?: LogLevel) => void} LogFunction
+ * Las líneas de estado de cada consulta llegan con `time`, el momento de la consulta, para que quien muestre
+ * la salida decida cómo presentarlo; las demás (encabezado, detalles) llegan sin `time`.
+ * @typedef {(line: string, level?: LogLevel, time?: Date) => void} LogFunction
  */
 /** @typedef {{ id: number, status: string, conclusion: string | null, htmlUrl: string, headBranch: string | null }} RunInfo */
 
@@ -377,17 +379,6 @@ export async function getRunFailureDetails(info, runId, token) {
 }
 
 /**
- * @param {number} ms
- * @returns {string}
- */
-function formatElapsed(ms) {
-    const totalSeconds = Math.floor(ms / 1000);
-    const minutes = String(Math.floor(totalSeconds / 60)).padStart(2, '0');
-    const seconds = String(totalSeconds % 60).padStart(2, '0');
-    return `${minutes}:${seconds}`;
-}
-
-/**
  * @param {RunInfo} run
  * @returns {string}
  */
@@ -504,16 +495,16 @@ function shouldQueryGithub(state, tick) {
 /**
  * Consulta el workflow y devuelve el texto a informar, si terminó y si terminó sin éxito.
  * @param {WatchState} state
- * @param {string} elapsed
+ * @param {Date} now
  * @returns {Promise<{ text: string, done: boolean, failed: boolean, details: string[] }>}
  */
-async function checkWorkflow(state, elapsed) {
+async function checkWorkflow(state, now) {
     state.githubQueries++;
     try {
         const run = await getWorkflowRun(state.info, state.tag, state.sha, state.token);
         if (run == null) return { text: 'todavía sin ejecución', done: false, failed: false, details: [] };
         if (run.htmlUrl !== state.shownRunUrl) {
-            state.log(`${elapsed} ejecución: ${run.htmlUrl}`);
+            state.log(`ejecución: ${run.htmlUrl}`, 'info', now);
             state.shownRunUrl = run.htmlUrl;
         }
         const done = run.status === 'completed';
@@ -568,11 +559,11 @@ async function describeFailure(state, run) {
  * @returns {Promise<number | null>}
  */
 async function watchTick(state, tick) {
-    const elapsed = formatElapsed(Date.now() - state.start);
+    const now = new Date();
     if (state.pushedAtTick == null) {
-        await refreshVersion(state, elapsed);
+        await refreshVersion(state, now);
         if (await isPushPending(state.dir, state.tag)) {
-            state.log(`${elapsed} push pending`);
+            state.log('push pending', 'info', now);
             return checkTimeout(state);
         }
         state.pushedAtTick = tick;
@@ -580,20 +571,20 @@ async function watchTick(state, tick) {
     const npm = await checkNpm(state.info);
     if (npm.status === 'validating') state.npmValidating = true;
     if (npm.status === 'published') {
-        state.log(`${elapsed} publicado en npm: ${state.info.name}@${state.info.version}`);
+        state.log(`publicado en npm: ${state.info.name}@${state.info.version}`, 'info', now);
         return EXIT_CODE.published;
     }
-    const npmLine = `${elapsed} npm: ${npm.text}`;
+    const npmLine = `npm: ${npm.text}`;
     let failed = false;
     if (shouldQueryGithub(state, tick)) {
-        const workflow = await checkWorkflow(state, elapsed);
+        const workflow = await checkWorkflow(state, now);
         const workflowText = `${WORKFLOW_FILE}: ${workflow.text}`;
-        state.log(npm.status === 'error' ? `${npmLine} | ${workflowText}` : `${elapsed} ${workflowText}`);
+        state.log(npm.status === 'error' ? `${npmLine} | ${workflowText}` : workflowText, 'info', now);
         workflow.details.forEach((detail) => { state.log(`      ${detail}`); });
         state.workflowDone = workflow.done;
         failed = workflow.failed;
     } else {
-        state.log(npmLine);
+        state.log(npmLine, 'info', now);
     }
     if (failed) return EXIT_CODE.workflowFailed;
     return checkTimeout(state);
@@ -604,10 +595,10 @@ async function watchTick(state, tick) {
  * vuelve a leer el package.json y, si cambió, pasa a esperar la versión nueva.
  * Si el package.json no se puede leer en este momento (por ejemplo, se está escribiendo), sigue con la anterior.
  * @param {WatchState} state
- * @param {string} elapsed
+ * @param {Date} now
  * @returns {Promise<void>}
  */
-async function refreshVersion(state, elapsed) {
+async function refreshVersion(state, now) {
     /** @type {PackageInfo} */
     let info;
     try {
@@ -619,8 +610,8 @@ async function refreshVersion(state, elapsed) {
     state.info = info;
     state.tag = `${TAG_PREFIX}${info.version}`;
     state.sha = await getTagCommit(state.dir, state.tag);
-    state.log(`${elapsed} versión cambiada: ahora espera ${info.name}@${info.version}, tag ${state.tag}`
-        + (state.sha != null ? ` (${state.sha.slice(0, 7)})` : ' (tag no encontrado localmente)'));
+    state.log(`versión cambiada: ahora espera ${info.name}@${info.version}, tag ${state.tag}`
+        + (state.sha != null ? ` (${state.sha.slice(0, 7)})` : ' (tag no encontrado localmente)'), 'info', now);
 }
 
 /**

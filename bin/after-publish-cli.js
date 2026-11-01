@@ -17,11 +17,54 @@ const useColor = process.stdout.isTTY === true && !process.env.NO_COLOR;
 
 /**
  * @param {string} line
- * @param {LogLevel} [level]
- * @returns {void}
+ * @param {LogLevel} level
+ * @returns {string}
  */
-function log(line, level = 'info') {
-    console.log(level === 'warning' && useColor ? `${ANSI_YELLOW}${line}${ANSI_RESET}` : line);
+function colored(line, level) {
+    return level === 'warning' && useColor ? `${ANSI_YELLOW}${line}${ANSI_RESET}` : line;
+}
+
+/**
+ * @param {Date} time
+ * @returns {string} la hora local como HH:MM
+ */
+function formatTime(time) {
+    return `${String(time.getHours()).padStart(2, '0')}:${String(time.getMinutes()).padStart(2, '0')}`;
+}
+
+/**
+ * Escribe la salida. Las líneas de estado (las que llegan con hora) empiezan con la hora en que apareció
+ * ese mensaje; si el mensaje siguiente es el mismo, en lugar de repetirlo se agrega un punto a esa línea.
+ * `close` termina la línea que haya quedado abierta.
+ * @param {(text: string) => void} write
+ * @returns {{ log: import('../after-publish.js').LogFunction, close: () => void }}
+ */
+export function createOutput(write) {
+    /** el mensaje de la línea de estado abierta (a la que se le agregan puntos), o null si no hay una */
+    /** @type {string | null} */
+    let openLine = null;
+    function close() {
+        if (openLine != null) write('\n');
+        openLine = null;
+    }
+    /**
+     * @param {string} line
+     * @param {LogLevel} [level]
+     * @param {Date} [time]
+     */
+    function log(line, level = 'info', time = undefined) {
+        if (time == null) {
+            close();
+            write(colored(line, level) + '\n');
+        } else if (line === openLine) {
+            write('.');
+        } else {
+            close();
+            write(colored(`${formatTime(time)} ${line}`, level));
+            openLine = line;
+        }
+    }
+    return { log, close };
 }
 
 /**
@@ -55,16 +98,20 @@ export function parseArgs(argv) {
  */
 export async function main(argv) {
     const parsed = parseArgs(argv);
+    const output = createOutput((text) => { process.stdout.write(text); });
     /** @type {WaitForPublishOptions} */
     const options = {
         dir: parsed._.dir ?? '.',
-        log,
+        log: output.log,
     };
     try {
         return await waitForPublish(options);
     } catch (err) {
+        output.close();
         console.error(describeError(err));
         return EXIT_CODE.configError;
+    } finally {
+        output.close();
     }
 }
 

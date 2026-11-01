@@ -1,4 +1,5 @@
 {
+  "window.title": "🏁 ${dirty}${separator}${rootName}${separator}${activeEditorShort}",
   "editor.renderWhitespace": "selection",
   "files.trimTrailingWhitespace": true,
   "files.insertFinalNewline": true,
